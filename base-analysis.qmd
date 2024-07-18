@@ -1,0 +1,439 @@
+---
+title: "Census CellxGene Census, COPD"
+author: "Matt Broerman"
+editor: source
+execute: 
+  warning: false
+bibliography: references.bib
+---
+
+```{r message=FALSE}
+# single cell packages
+library(cellxgene.census)
+library(tiledbsoma)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+
+# metadata wrangling
+library(arrow)
+library(dplyr)
+library(stringr)
+library(glue)
+library(tibble)
+library(tidyr)
+library(glue)
+```
+
+## Update
+
+I am waiting on a [reply](https://cziscience.slack.com/archives/C04LMG88VKJ/p1721230830567089) from cellxgene staff on an important data-quality issue I think I identified (flipped the value of the "primary_data") flag on the data we were considering. You can see the analysis I did, but my **observation** and **interpretation** is subject to updates from them. It should be easy to fix the rest once I get clarity from them.
+
+## Summary
+
+This document explores the integration and analysis of single-cell RNA sequencing data from two major atlases: the Single-Cell Lung Cancer Atlas (LuCA) and the Human Lung Cell Atlas (HCLA), focusing on Chronic Obstructive Pulmonary Disease (COPD) samples. The primary goal is to assess whether the datasets can be combined for analysis despite their different methodologies and sources.
+
+Using the cellxgene.census package, the data from these atlases were queried and filtered to include only the relevant COPD samples. Initial exploration revealed significant differences in the distribution of cell types between the two datasets. This divergence is likely due to different cell type annotation methods used by LuCA and HCLA.
+
+The analysis employed cell embeddings and clustering techniques to further investigate the data. Despite using advanced embedding methods designed to mitigate technical variability, the two atlases showed substantial differences in cell type distributions and underlying data characteristics. This suggests that integrating these datasets poses challenges, not only due to differences in cell type annotation but also due to inherent variations in the data itself.
+
+Future steps include using uniform cell embeddings and subsampling to handle large datasets. However, initial findings indicate that despite shared methodologies, the datasets are not readily comparable, highlighting the complexities of integrating diverse single-cell datasets.
+
+## Census data
+
+Through email exchange, due to the presence of CODP patients, we decided to query
+
+-   The single-cell lung cancer atlas (LuCA) -- extended atlas
+-   An integrated cell atlas of the human lung in health and disease (full)
+
+### Query sample data
+
+I retrieved the `dataset_id`s separately.
+
+```{r}
+census <- open_soma(census_version = "2023-12-15")
+
+# The single-cell lung cancer atlas (LuCA) -- extended atlas
+luca_study_id <- "1e6a6ef9-7ec9-4c90-bbfb-2ad3c3165fd1"
+
+# An integrated cell atlas of the human lung in health and disease (full)
+hcla_study_id <- "9f222629-9e39-47d0-b83f-e08d610c7479"
+```
+
+Pull together metadata and helper functions for queries.
+
+```{r}
+fmt_value_filter <- function(type, val){
+  type <- switch (type,
+    dataset = "dataset_id",
+    gene = "feature_id",
+    cell_type = "cell_type",
+    sex = "sex",
+    disease = "disease",
+    tissue_general = "tissue_general",
+    is_primary_data = "is_primary_data",
+    stop("invalid type")
+  )
+  return(glue::glue("{type} %in% c({toString(shQuote({val}))})"))
+}
+
+
+val_filter <- 
+  str_c(
+    fmt_value_filter("dataset", val = c(luca_study_id, hcla_study_id)),
+    fmt_value_filter("disease", val = c("chronic obstructive pulmonary disease", "normal")),
+    fmt_value_filter("tissue_general", "lung"),
+    sep = " & "
+)
+
+copd_filter <- fmt_value_filter("disease", val = c("chronic obstructive pulmonary disease"))
+
+cell_cols <- c(
+    "soma_joinid",
+    "is_primary_data",
+    "assay",
+    "cell_type",
+    "sex",
+    "tissue",
+    "tissue_general",
+    "suspension_type",
+    "disease",
+    "donor_id",
+    "disease_ontology_term_id",
+    "dataset_id"
+  )
+
+
+copd_check_cols <- c("soma_joinid", "is_primary_data", "donor_id", "dataset_id")
+
+```
+
+Then execute the query.
+
+```{r eval=FALSE}
+
+
+# Open obs SOMADataFrame
+obs_conn <-  census$get("census_data")$get("homo_sapiens")$get("obs")
+
+# Read as Arrow Table
+obs_query <-  obs_conn$read(
+  value_dplyr::filter = val_filter,
+  column_names = cell_cols
+)
+
+# Read as Arrow Table
+copd_obs_query <-  obs_conn$read(
+  value_dplyr::filter = copd_filter,
+  column_names = copd_check_cols
+)
+
+# Concatenates results to an Arrow Table
+cell_metadata <-  obs_query$concat()
+copd_metadata <-  copd_obs_query$concat()
+
+
+write_dataset(cell_metadata, path = "data/sc_copd_lung.arrow", format = "arrow")
+write_dataset(copd_metadata, path = "data/sc_copd_census.arrow", format = "arrow")
+```
+
+The result is a high-performance dataframe (arrow). In this case, I saved the result previously and reload it.
+
+```{r}
+cell_metadata <- open_dataset("data/sc_copd_lung.arrow", format = "arrow")
+copd_metadata <- open_dataset("data/sc_copd_census.arrow", format = "arrow")
+
+copd_metadata |> 
+  dplyr::count(is_primary_data, dataset_id) |> 
+  collect() |> 
+  mutate(study = case_match(dataset_id, luca_study_id ~ "LUCA", hcla_study_id ~ "HCLA")) |> knitr::kable()
+```
+
+Straightaway we note `is_primary_data`. This is an important flag to avoid duplication of cells in analysis. Each cell should have the flag exactly once. Only LUCA has this for COPD patients. However, whereas another unidentified study uses those cells (sharing the `n` but with a `FALSE` flag), the HCLA seems to draw from a different source than LUCA at least in part and these are not in the census yet (12k in excess).
+
+I checked the publications and the internet and found no clarity. I submitted a question on provenance to the Slack user group.
+
+For now, we will treat the two sets as non-duplicative.
+
+```{r}
+cell_metadata |> 
+  dplyr::filter(is_primary_data | disease == "chronic obstructive pulmonary disease") |> 
+  dplyr::count(disease, disease_ontology_term_id, dataset_id, is_primary_data) |> 
+  collect() |> 
+  mutate(study = case_match(dataset_id, luca_study_id ~ "LUCA", hcla_study_id ~ "HCLA")) |> 
+  select(-dataset_id)
+```
+
+### Atlas Comparison
+
+```{r fig.height=8}
+cell_metadata_sub <- cell_metadata |> 
+  dplyr::filter(is_primary_data | disease == "chronic obstructive pulmonary disease")
+
+cell_metadata_sub |> 
+  dplyr::count(disease, dataset_id, assay) |> 
+  collect() |> 
+  mutate(study = case_match(dataset_id, luca_study_id ~ "LUCA", hcla_study_id ~ "HCLA"))  |> 
+  select(-dataset_id)
+  
+
+custom_labels <- c(luca_study_id = "LUCA", hcla_study_id = "HCLA")
+
+rename_values <- function(df) {
+  df |>
+    mutate(study = case_match(dataset_id, luca_study_id ~ "LUCA", hcla_study_id ~ "HCLA")) |>
+    mutate(
+      disease = case_match(
+        disease,
+        "chronic obstructive pulmonary disease" ~ "COPD",
+        .default = disease
+      )
+    )
+}
+
+cell_metadata_sub |> 
+  dplyr::count(disease, cell_type, dataset_id) |> 
+  collect() |> 
+  rename_values() |> 
+  ggplot(aes(n, cell_type, fill = disease)) +
+  geom_col(position = position_dodge()) +
+  facet_wrap(vars(study))
+
+cell_metadata_sub |> 
+  dplyr::count(donor_id, cell_type, dataset_id) |> 
+  collect() |> 
+  mutate(donor_id = paste0(dataset_id, donor_id)) |>
+  mutate(study = case_match(dataset_id, luca_study_id ~ "LUCA", hcla_study_id ~ "HCLA")) |>
+  ggplot(aes(donor_id, cell_type, fill = log(n), color = study)) +
+  geom_tile() +
+  theme(axis.text.x = element_blank()) +
+  labs(title = "Study effect of depth and cell type assignment")
+```
+
+### Exploratory Conclusion
+
+We are interested in whether it is fair to lump samples two atlases sharing the sample disease conditions. The thought was that single cell atlases should have an unbiased sampling of cell-types, and share distributions of those cell-types.
+
+We found significant distribution divergence, particularly in native cells. This is probably due to different cell-type calling methods:
+
+For LuCA
+
+> Annotation of cell-types based on marker genes and unsupervised leiden clustering. Integration of additional datasets with transfer learning using scArches.
+
+For HCLA
+
+> The HLCA core includes data of healthy lung tissue from 107 individuals, and includes manual cell type annotations based on consensus across 6 independent experts, as well as demographic, biological and technical metadata. The datasets in the HLCA core were integrated using scANVI. The HLCA core can be used as a reference to map new datasets onto using scArches.
+
+So despite significant overlap in methods in assay and algorithms, they evidently called a different number of clusters and corresponding cell-types.
+
+#### Fixes
+
+As discussed in [tutorials](https://chanzuckerberg.github.io/cellxgene-census/notebooks/analysis_demo/comp_bio_embedding_exploration.html), we can try to use the uniform cell embeddings (signatures) that are constructed across datasets.
+
+### Get RNA data and embeddings
+
+Note that after a couple of attempts, `get_single_cell_experiment()` results in:
+
+> Error: vector memory exhausted (limit reached?) In addition: Warning message: In asMethod(object) : sparse-\>dense coercion: allocating vector of size 2.4 GiB
+
+The issue is that after the data downloads, the function tries to turn all of the sparse data into a dense data. And for 1.6M x 200, that is too big.
+
+Instead, we will do a first pass with subsampling.
+
+```{r}
+
+set.seed(123)
+
+samp_soma_ids <-
+  cell_metadata_sub |> 
+  collect() |>
+  # stupid error that causes invisible non-random sampling
+  slice_sample(n = 1E5) |> 
+  pull(soma_joinid)
+
+```
+
+This takes \~ 40 minutes, and so we cache the results
+
+```{r eval=FALSE}
+gene_ids <- "ENSG00000142627"
+organism <-  "Homo sapiens"
+
+
+sce_obj <-  get_single_cell_experiment(
+   census = census,
+   organism = organism,
+   X_layers = c("raw", "normalized"), # depth normalizations, not in docs yet
+   var_value_dplyr::filter = fmt_value_filter("gene", gene_ids),
+   obs_value_dplyr::filter = val_filter,
+   obs_column_names = cell_cols,
+   obs_coords = samp_soma_ids,
+   obsm_layers = c("scvi")
+)
+saveRDS(sce_obj, "data/yang_sub_copd_sce_embed2.rds")
+
+
+```
+
+After loading cache, running the standard processing for clustering, on UMAP and SCVI.
+
+```{r fig.height=8}
+sce_obj <- readRDS("data/yang_sub_copd_sce_embed2.rds")
+
+set.seed(123)
+
+sce_obj <- sce_obj |> runUMAP(dimred = "scvi")
+sce_obj$cluster <-
+  clusterCells(
+    sce_obj,
+    use.dimred = "UMAP"
+  )
+
+sce_obj$louvain15 <- clusterCells(sce_obj, 
+                           use.dimred = "UMAP", 
+                           BLUSPARAM = bluster::NNGraphParam(k = 15, cluster.fun = "louvain"))
+```
+
+For display purposes, we lump cell types with less than 1000 to the other category.
+
+```{r fig.height=8}
+sce_obj |> 
+  colData() |> 
+  as_tibble() |> 
+  dplyr::count(cell_type, sort = TRUE) |> 
+  mutate(cell_type = reorder(cell_type, n)) |> 
+  ggplot(aes(n, cell_type)) +
+  geom_col() +
+  geom_vline(xintercept = 1000)
+```
+
+```{r}
+
+colData(sce_obj)$Cell_Type <- 
+  colData(sce_obj)$cell_type |> 
+  as.factor() |> 
+  forcats::fct_lump_min(min = 1000, other_level = "other")
+
+colData(sce_obj)$study <- 
+  colData(sce_obj)$dataset_id |> 
+  case_match(luca_study_id ~ "LUCA", hcla_study_id ~ "HCLA")
+
+set.seed(123)
+
+sce_sampled <- sce_obj[, sample(ncol(sce_obj), 2000)]
+
+sce_sampled$clust_scvi <- clusterCells(sce_sampled, 
+                           use.dimred = "scvi", 
+                           BLUSPARAM = bluster::NNGraphParam(k = 30))
+
+sce_sampled$clust_umap <- clusterCells(sce_sampled, 
+                           use.dimred = "UMAP", 
+                           BLUSPARAM = bluster::NNGraphParam(k = 30))
+
+
+plot_embed <- function(sce_obj, color) {
+  
+  # Check if color is in colData names
+  if (color %in% colnames(colData(sce_obj))) {
+    # Calculate the number of columns
+    n <- ncol(sce_obj)
+    
+    # Create the plot
+    plotReducedDim(sce_obj, dimred = "UMAP", colour_by = color) +
+      labs(title = "Cell Embeddings",
+           subtitle = glue("Downsample ({n}), colored by {color}"))
+    
+  } else if (color %in% rownames(sce_obj)) {
+    # Extract the expression values for the gene
+    gene_expression <- assay(sce_obj, "raw")[color, ]
+    
+    # Add gene expression as a new column in colData
+    colData(sce_obj)[[color]] <- gene_expression
+    
+    # Calculate the number of columns
+    n <- ncol(sce_obj)
+    
+    # Create the plot
+    plotReducedDim(sce_obj, dimred = "UMAP", colour_by = color) +
+      labs(title = "Cell Embeddings",
+           subtitle = glue("Downsample ({n}), colored by {color} expression"))
+    
+  } else {
+    stop(glue("Column or gene {color} not found in the dataset."))
+  }
+}
+
+sce_sampled |> plot_embed("clust_umap")
+sce_sampled |> plot_embed("clust_scvi")
+
+
+```
+
+#### Observations on clusters
+
+For clustering, we are using cell embeddings (here SCVI, which [appears](https://chanzuckerberg.github.io/cellxgene-census/notebooks/analysis_demo/comp_bio_embedding_exploration.html) to be the best performing, but we can check the others) and indirect on the UMAP of embeddings.
+
+1.  `clust_umap` is only for reference in discussion here.
+2.  `clust_scvi` is clustering on meaningful cell embeddings
+
+Notice that the pretty picture due to the UMAP-based clustering (the standard practice) misleads. In fact, clustering on the basis of `scvi` shows that UMAP (the display dimension)
+
+1.  spreads out like clusters (eg `clust_scvi == 3`)
+2.  collocates distinct clusters (eg. `clust_umap %in% c(10, 11)`)
+
+```{r}
+sce_sampled |> plot_embed("study")
+sce_sampled |> plot_embed("assay")
+sce_sampled |> plot_embed("disease")
+sce_sampled |> plot_embed("Cell_Type")
+sce_sampled |> plot_embed("ENSG00000142627")
+
+
+
+sce_obj[, assay(sce_obj, "raw")["ENSG00000142627", ] > 5] |> 
+  colData() |> 
+  as_tibble() |> 
+  dplyr::count(cell_type, sort = TRUE) |> 
+  knitr::kable()
+
+sce_obj[, assay(sce_obj, "raw")["ENSG00000142627", ] > 5] |> 
+  colData() |> 
+  as_tibble() |> 
+  dplyr::count(donor_id, sort = TRUE) |> 
+  head(15) |> 
+  knitr::kable()
+  
+```
+
+#### Observations on metadata
+
+Further notice
+
+1.  clear separation of cell clusters by `assay` in most cases
+2.  clear separation of cell clusters by `study` in most cases
+3.  good mixing of phenotype in LUCA (large central cluster) but separation in HCLA (upper half-moon)
+4.  Similar mixing of cell types in `clust_umap` 10 wand 11 (Alveolar macrophage and native cell), distinct in both the UMAP and `scvi` space.
+5.  High Expression of EphA2 collocated in `clust_umap` 8, but that this does not correspond to something obvious in the cell embedding space.
+6.  EphA2 is concentrated in a few cell types and donors, but relatively rare (denominator 100k)
+
+### Interpretation
+
+Recall we came to the cell embeddings hoping to find that although perhaps a different cell type method was used, that when the cells are embedded in a space that is robust to technical effects, they would be more readily comparable. Indeed, easy cross-study comparison is one of the larger aims of CellxGene. However, what we found is more troubling, namely that the two prominent atlases differ not merely in cell type classification, but also in the underlying data, despite significant overlap library preparation protocols. In particular, with respect to `assay` and `study`. However, tutorials point to the same problem.
+
+There seems to be a complex interaction between assay and study, where in some cases there is good mixing, but in others, and notably in the cases where `scvi` and `umap` tend to agree (`clust_umap` 11 and 19), they seem to come only from cells in HCLA with the 10X 3\` v3 assay.
+
+All of this suggests that neither with respect to the cell type classification scheme, nor with respect the embeddings we have available (analyzing here the best performing `scvi` ones) can we integrate these two datasets easily.
+
+Moreover, the main gene idenitified for inquiry, EphA2 (`ENSG00000142627`) was not illuminating.
+
+## Next steps
+
+I found two larger gene sets to investigate.
+
+1.  Gene Ontology offers a cell senescence gene set
+2.  A SASP related gene set was recently developed @saul2022
+3.  We could look at donor specific response, as EphA2 seems to be in part an oncogenic response @shi2023
+
+```{r}
+census$close()
+```

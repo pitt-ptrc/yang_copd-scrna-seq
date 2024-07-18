@@ -1,0 +1,8 @@
+project:
+  type: default
+  output-dir: _reports
+
+toc: true
+embed-resources: true
+code-fold: true
+bibliography: references.bib
